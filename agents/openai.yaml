@@ -1,0 +1,14 @@
+interface:
+  display_name: Frame Patcher
+  short_description: Локально чинит дефекты без перегенерации кадра
+  default_prompt: Use $frame-patcher to repair only the marked defects in this image
+    and preserve every other pixel.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
