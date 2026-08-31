@@ -94,6 +94,55 @@ def make_default_mask(
     return mask
 
 
+def make_polygon_mask(path: Path, size: tuple[int, int]) -> Image.Image:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    points = data.get("points") if isinstance(data, dict) else data
+    if not isinstance(points, list) or len(points) < 3:
+        fail("Polygon JSON must contain at least three source-native [x, y] points")
+    parsed: list[tuple[int, int]] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            fail("Each polygon point must be [x, y]")
+        try:
+            x, y = int(round(float(point[0]))), int(round(float(point[1])))
+        except (TypeError, ValueError) as exc:
+            fail(f"Invalid polygon point {point}: {exc}")
+        if not (0 <= x < size[0] and 0 <= y < size[1]):
+            fail(f"Polygon point {(x, y)} is outside source size {size}")
+        parsed.append((x, y))
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).polygon(parsed, fill=255)
+    return mask
+
+
+def choose_feather(
+    explicit: float | None, edge: str, target_bbox: tuple[int, int, int, int]
+) -> tuple[float, list[str]]:
+    short_side = max(1, min(target_bbox[2], target_bbox[3]))
+    if explicit is None:
+        if edge == "hard":
+            feather = 1.0
+        elif edge == "soft":
+            feather = float(min(8, max(2, round(short_side * 0.03))))
+        else:
+            feather = float(min(3, max(1, round(short_side * 0.02))))
+    else:
+        feather = max(0.0, float(explicit))
+    warnings: list[str] = []
+    if feather > short_side * 0.05:
+        warnings.append(
+            f"Feather {feather:g}px exceeds 5% of target short side ({short_side}px); inspect for halos"
+        )
+    return feather, warnings
+
+
+def mask_overlay(image: Image.Image, mask: Image.Image, color: tuple[int, int, int], alpha: int) -> Image.Image:
+    base = image.convert("RGBA")
+    tint = Image.new("RGBA", image.size, (*color, 0))
+    tint.putalpha(mask.point(lambda p: alpha if p >= 128 else 0))
+    return Image.alpha_composite(base, tint)
+
+
 def fit_image(image: Image.Image, size: tuple[int, int], force: bool = False) -> Image.Image:
     target_ratio = size[0] / size[1]
     source_ratio = image.width / image.height
@@ -121,6 +170,7 @@ def command_prepare(args: argparse.Namespace) -> None:
     shutil.copy2(source_path, source_copy)
 
     full_mask: Image.Image | None = None
+    mask_source = "bbox"
     if args.mask:
         with Image.open(args.mask) as opened:
             full_mask = opened.convert("L")
@@ -131,10 +181,19 @@ def command_prepare(args: argparse.Namespace) -> None:
         if not mask_box:
             fail("Mask contains no selected pixels")
         target_bbox = (mask_box[0], mask_box[1], mask_box[2] - mask_box[0], mask_box[3] - mask_box[1])
+        full_mask = binary
+        mask_source = "source-sized-mask"
+    elif args.polygon:
+        full_mask = make_polygon_mask(Path(args.polygon).resolve(), source.size)
+        mask_box = full_mask.getbbox()
+        if not mask_box:
+            fail("Polygon contains no selected pixels")
+        target_bbox = (mask_box[0], mask_box[1], mask_box[2] - mask_box[0], mask_box[3] - mask_box[1])
+        mask_source = "source-native-polygon"
     elif args.bbox:
         target_bbox = parse_bbox(args.bbox)
     else:
-        fail("prepare requires --bbox or --mask")
+        fail("prepare requires --bbox, --mask, or --polygon")
 
     target_bbox = clamp_bbox(target_bbox, width, height)
     context_bbox = expand_bbox(target_bbox, width, height, args.context, args.min_padding)
@@ -147,7 +206,7 @@ def command_prepare(args: argparse.Namespace) -> None:
         hard_native = make_default_mask((cw, ch), local_bbox, args.shape)
     else:
         hard_native = full_mask.crop((cx, cy, cx + cw, cy + ch)).point(lambda p: 255 if p >= 128 else 0)
-    feather = max(0.0, float(args.feather))
+    feather, warnings = choose_feather(args.feather, args.edge, target_bbox)
     soft_native = hard_native.filter(ImageFilter.GaussianBlur(radius=feather)) if feather else hard_native.copy()
 
     scale = min(4.0, max(0.25, args.work_size / max(cw, ch)))
@@ -169,6 +228,11 @@ def command_prepare(args: argparse.Namespace) -> None:
     hard_work.save(hard_work_path)
     soft_work.save(soft_work_path)
 
+    full_hard = Image.new("L", source.size, 0)
+    full_hard.paste(hard_native, (cx, cy))
+    mask_overlay(source, full_hard, (255, 30, 30), 92).save(output_dir / "mask-overlay-native.png")
+    mask_overlay(crop_work, hard_work, (255, 30, 30), 92).save(output_dir / "crop-mask-overlay.png")
+
     guide = source.convert("RGBA")
     overlay = Image.new("RGBA", source.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -178,29 +242,56 @@ def command_prepare(args: argparse.Namespace) -> None:
     guide.save(output_dir / "guide.png")
 
     request = (args.request or "repair the indicated defect").strip()
+    invariants = [item.strip() for item in (args.invariant or []) if item.strip()]
+    protected = [item.strip() for item in (args.protected or []) if item.strip()]
+    uncertain = [item.strip() for item in (args.uncertain or []) if item.strip()]
+    if args.risk == "reconstruction" and mask_source == "bbox":
+        warnings.append(
+            "Reconstruction uses a generated bbox mask; prefer --mask or --polygon for silhouettes and multi-material edges"
+        )
+    if args.risk == "reconstruction" and not uncertain:
+        warnings.append("Reconstruction has no declared uncertain region; do not imply exact recovery")
+    contract_lines = []
+    if invariants:
+        contract_lines.append("Must be true: " + "; ".join(invariants) + ".")
+    if protected:
+        contract_lines.append("Protect: " + "; ".join(protected) + ".")
+    if uncertain:
+        contract_lines.append("Uncertain hidden structure: " + "; ".join(uncertain) + ".")
     prompt = (
         "Use case: precise-object-edit\n"
-        "Input: a context crop from a larger still frame.\n"
+        "Inputs: first image is a context crop; second image, when provided, is the exact edit mask "
+        "where white may change and black must remain unchanged.\n"
         f"Primary request: {request}.\n"
-        "Change only the indicated central defect. Preserve crop framing, camera, identity, geometry, "
+        f"Risk class: {args.risk}.\n"
+        + ("\n".join(contract_lines) + "\n" if contract_lines else "")
+        + "Change only the indicated central defect. Preserve crop framing, camera, identity, geometry, "
         "lighting, color, perspective, texture and all surrounding context. Return the same composition "
         "and aspect ratio. Do not beautify, reframe, add objects, or modify unrelated pixels."
     )
     (output_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": str(source_copy),
         "source_sha256": sha256(source_copy),
         "source_size": [width, height],
         "source_mode": source.mode,
+        "coordinate_space": "source_native",
+        "mask_source": mask_source,
         "target_bbox": list(target_bbox),
         "context_bbox": list(context_bbox),
         "local_bbox": list(local_bbox),
         "work_size": list(work_size),
         "work_scale": scale,
         "feather": feather,
+        "edge": args.edge,
+        "risk": args.risk,
         "request": request,
+        "invariants": invariants,
+        "protected": protected,
+        "uncertain": uncertain,
+        "warnings": warnings,
         "paths": {
             "crop_native": str(crop_native_path),
             "crop_work": str(crop_work_path),
@@ -209,11 +300,26 @@ def command_prepare(args: argparse.Namespace) -> None:
             "mask_hard_work": str(hard_work_path),
             "mask_soft_work": str(soft_work_path),
             "guide": str(output_dir / "guide.png"),
+            "mask_overlay_native": str(output_dir / "mask-overlay-native.png"),
+            "crop_mask_overlay": str(output_dir / "crop-mask-overlay.png"),
             "prompt": str(output_dir / "prompt.txt"),
         },
     }
     save_json(output_dir / "manifest.json", manifest)
-    print(json.dumps({"target_bbox": target_bbox, "context_bbox": context_bbox, "work_size": work_size}, indent=2))
+    print(
+        json.dumps(
+            {
+                "target_bbox": target_bbox,
+                "context_bbox": context_bbox,
+                "work_size": work_size,
+                "coordinate_space": "source_native",
+                "risk": args.risk,
+                "feather": feather,
+                "warnings": warnings,
+            },
+            indent=2,
+        )
+    )
 
 
 def ring_from_mask(mask: Image.Image, radius: int = 12) -> np.ndarray:
@@ -256,6 +362,7 @@ def command_compose(args: argparse.Namespace) -> None:
         edited = opened.convert(source.mode)
     cx, cy, cw, ch = [int(v) for v in manifest["context_bbox"]]
     edited_native = fit_image(edited, (cw, ch), force=args.force_resize)
+    edited_native.save(manifest_path.parent / "edited-native.png")
     original_crop = source.crop((cx, cy, cx + cw, cy + ch))
     hard_mask = Image.open(manifest["paths"]["mask_hard_native"]).convert("L")
     soft_mask = Image.open(manifest["paths"]["mask_soft_native"]).convert("L")
@@ -308,29 +415,96 @@ def command_verify(args: argparse.Namespace) -> None:
     pixel_diff = diff.max(axis=2) if diff.ndim == 3 else diff
 
     cx, cy, cw, ch = [int(v) for v in manifest["context_bbox"]]
-    soft = np.asarray(Image.open(manifest["paths"]["mask_soft_native"]).convert("L"), dtype=np.uint8)
-    full_mask = np.zeros((source.height, source.width), dtype=np.uint8)
-    full_mask[cy : cy + ch, cx : cx + cw] = soft
-    outside = full_mask == 0
-    changed_outside = int(np.count_nonzero(pixel_diff[outside]))
-    max_outside = int(pixel_diff[outside].max()) if outside.any() else 0
-    changed_inside = int(np.count_nonzero(pixel_diff[~outside]))
+    hard_image = Image.open(manifest["paths"]["mask_hard_native"]).convert("L")
+    soft_image = Image.open(manifest["paths"]["mask_soft_native"]).convert("L")
+    hard = np.asarray(hard_image, dtype=np.uint8)
+    soft = np.asarray(soft_image, dtype=np.uint8)
+    full_hard = np.zeros((source.height, source.width), dtype=np.uint8)
+    full_soft = np.zeros((source.height, source.width), dtype=np.uint8)
+    full_hard[cy : cy + ch, cx : cx + cw] = hard
+    full_soft[cy : cy + ch, cx : cx + cw] = soft
+    outside_hard = full_hard == 0
+    outside_soft = full_soft == 0
+    feather_ring = (full_soft > 0) & (full_hard < 128)
+    inside_hard = full_hard >= 128
+    changed_outside_soft = int(np.count_nonzero(pixel_diff[outside_soft]))
+    changed_outside_hard = int(np.count_nonzero(pixel_diff[outside_hard]))
+    changed_feather_ring = int(np.count_nonzero(pixel_diff[feather_ring]))
+    changed_inside_hard = int(np.count_nonzero(pixel_diff[inside_hard]))
+    max_outside_soft = int(pixel_diff[outside_soft].max()) if outside_soft.any() else 0
 
     verify_dir = Path(args.verify_dir).resolve()
     verify_dir.mkdir(parents=True, exist_ok=True)
     heat = np.clip(pixel_diff.astype(np.float32) * 6.0, 0, 255).astype(np.uint8)
     heat_image = Image.fromarray(heat, mode="L")
     heat_image.save(verify_dir / "heatmap.png")
+
+    source_crop = source.crop((cx, cy, cx + cw, cy + ch)).convert("RGB")
+    output_crop = output.crop((cx, cy, cx + cw, cy + ch)).convert("RGB")
+    boundary_outer = hard_image.filter(ImageFilter.MaxFilter(size=5))
+    boundary_inner = hard_image.filter(ImageFilter.MinFilter(size=5))
+    boundary_array = np.asarray(boundary_outer, dtype=np.int16) - np.asarray(boundary_inner, dtype=np.int16)
+    boundary_mask = Image.fromarray(np.where(boundary_array > 0, 255, 0).astype(np.uint8), mode="L")
+    mask_overlay(output_crop, boundary_mask, (255, 0, 255), 210).save(verify_dir / "boundary-overlay.png")
+
+    panel_scale = min(1.0, 768.0 / max(cw, ch))
+    panel_size = (max(1, int(round(cw * panel_scale))), max(1, int(round(ch * panel_scale))))
+    label_height = 28
+
+    def labeled_panel(image: Image.Image, label: str) -> Image.Image:
+        panel = Image.new("RGB", (panel_size[0], panel_size[1] + label_height), (24, 24, 24))
+        panel.paste(image.convert("RGB").resize(panel_size, RESAMPLE), (0, label_height))
+        ImageDraw.Draw(panel).text((8, 7), label, fill=(245, 245, 245))
+        return panel
+
+    heat_crop = heat_image.crop((cx, cy, cx + cw, cy + ch))
+    zero = Image.new("L", heat_crop.size, 0)
+    heat_rgb = Image.merge("RGB", (heat_crop, zero, zero))
+    exact_mask_panel = mask_overlay(output_crop, hard_image, (255, 30, 30), 110)
+    panels = [
+        labeled_panel(source_crop, "SOURCE"),
+        labeled_panel(output_crop, "OUTPUT"),
+        labeled_panel(heat_rgb, "PIXEL DIFF"),
+        labeled_panel(exact_mask_panel, "HARD MASK"),
+    ]
+    contact = Image.new("RGB", (panels[0].width * 2, panels[0].height * 2), (18, 18, 18))
+    contact.paste(panels[0], (0, 0))
+    contact.paste(panels[1], (panels[0].width, 0))
+    contact.paste(panels[2], (0, panels[0].height))
+    contact.paste(panels[3], (panels[0].width, panels[0].height))
+    contact.save(verify_dir / "qa-contact-sheet.png")
+
+    visual_review = {
+        "status": "pending",
+        "required_scales": ["200% boundary", "100% object", "fit-to-screen full frame"],
+        "must_be_true": manifest.get("invariants", []),
+        "protected": manifest.get("protected", []),
+        "uncertain": manifest.get("uncertain", []),
+        "reject_if": [
+            "old defect remains",
+            "protected geometry shifted",
+            "new object or anatomy error",
+            "broken topology, text, perspective, or material",
+            "halo, seam, or double contour",
+        ],
+    }
+    save_json(verify_dir / "visual-review.json", visual_review)
+
+    technical_pass = changed_outside_soft == 0
     result = {
-        "pass": changed_outside == 0,
-        "changed_pixels_outside_mask": changed_outside,
-        "max_channel_difference_outside_mask": max_outside,
-        "changed_pixels_inside_mask": changed_inside,
+        "pass": technical_pass,
+        "technical_pass": technical_pass,
+        "visual_acceptance": "pending",
+        "changed_pixels_outside_soft_mask": changed_outside_soft,
+        "max_channel_difference_outside_soft_mask": max_outside_soft,
+        "changed_pixels_outside_hard_mask": changed_outside_hard,
+        "changed_pixels_in_feather_ring": changed_feather_ring,
+        "changed_pixels_inside_hard_mask": changed_inside_hard,
         "source_size": list(source.size),
     }
     save_json(verify_dir / "verification.json", result)
     print(json.dumps(result, indent=2))
-    if changed_outside:
+    if changed_outside_soft:
         raise SystemExit(2)
 
 
@@ -416,14 +590,23 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("prepare", help="Create a contextual crop and local masks")
     prepare.add_argument("source")
     prepare.add_argument("output_dir")
-    prepare.add_argument("--bbox", help="x,y,width,height in source pixels")
-    prepare.add_argument("--mask", help="Optional source-sized grayscale mask")
+    region = prepare.add_mutually_exclusive_group(required=True)
+    region.add_argument("--bbox", help="x,y,width,height in source-native pixels")
+    region.add_argument("--mask", help="Source-sized grayscale mask")
+    region.add_argument("--polygon", help="JSON file with source-native polygon points")
     prepare.add_argument("--request", default="repair the indicated defect")
     prepare.add_argument("--context", type=float, default=2.5)
     prepare.add_argument("--min-padding", type=int, default=48)
     prepare.add_argument("--work-size", type=int, default=1024)
-    prepare.add_argument("--feather", type=float, default=8.0)
+    prepare.add_argument("--feather", type=float, default=None, help="Explicit feather radius; default is adaptive")
+    prepare.add_argument("--edge", choices=["auto", "hard", "soft"], default="auto")
     prepare.add_argument("--shape", choices=["rect", "ellipse"], default="rect")
+    prepare.add_argument(
+        "--risk", choices=["repair", "inferred", "reconstruction"], default="repair"
+    )
+    prepare.add_argument("--invariant", action="append", help="Visible fact required for acceptance")
+    prepare.add_argument("--protected", action="append", help="Nearby structure that must remain unchanged")
+    prepare.add_argument("--uncertain", action="append", help="Hidden structure not recoverable from source pixels")
     prepare.set_defaults(func=command_prepare)
 
     compose = commands.add_parser("compose", help="Composite one edited crop through the local mask")
