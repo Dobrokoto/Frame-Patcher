@@ -162,6 +162,24 @@ def fit_image(image: Image.Image, size: tuple[int, int], force: bool = False) ->
     return image.resize(size, RESAMPLE)
 
 
+def normalize_to_work_size(
+    image: Image.Image,
+    work_size: tuple[int, int],
+    force: bool = False,
+) -> tuple[Image.Image, float]:
+    target_ratio = work_size[0] / work_size[1]
+    source_ratio = image.width / image.height
+    ratio_error = abs(source_ratio / target_ratio - 1.0)
+    if ratio_error > 0.01 and not force:
+        fail(
+            f"Edited crop aspect ratio differs from the prepared work crop by {ratio_error:.1%}; "
+            "reject or regenerate it. Use --force-resize only after approving a deliberate transform"
+        )
+    if image.size == work_size:
+        return image.copy(), ratio_error
+    return image.resize(work_size, RESAMPLE), ratio_error
+
+
 def load_mask(path: Path) -> Image.Image:
     with Image.open(path) as opened:
         if opened.mode == "RGBA":
@@ -597,6 +615,102 @@ def command_postmask(args: argparse.Namespace) -> None:
     )
 
 
+def command_stage(args: argparse.Namespace) -> None:
+    manifest_path = Path(args.manifest).resolve()
+    manifest = read_json(manifest_path)
+    if manifest.get("mode") == "additive":
+        fail("Additive generations use postmask, not stage")
+
+    edited_crop_path = Path(args.edited_crop).resolve()
+    if not edited_crop_path.is_file():
+        fail(f"Edited crop not found: {edited_crop_path}")
+
+    crop_work_path = Path(manifest["paths"]["crop_work"])
+    hard_work_path = Path(manifest["paths"]["mask_hard_work"])
+    with Image.open(crop_work_path) as opened:
+        original_work = opened.convert("RGB")
+    with Image.open(hard_work_path) as opened:
+        hard_work = opened.convert("L")
+    with Image.open(edited_crop_path) as opened:
+        edited_input = opened.convert("RGB")
+
+    work_size = tuple(int(value) for value in manifest["work_size"])
+    normalized, ratio_error = normalize_to_work_size(
+        edited_input, work_size, force=args.force_resize
+    )
+    output_dir = manifest_path.parent
+    staged_path = output_dir / "edited-staged.png"
+    normalized.save(staged_path)
+
+    side_by_side = Image.new("RGB", (work_size[0] * 2, work_size[1]), (20, 20, 20))
+    side_by_side.paste(original_work, (0, 0))
+    side_by_side.paste(normalized, (work_size[0], 0))
+    side_by_side.save(output_dir / "registration-side-by-side.png")
+
+    block = max(24, min(work_size) // 12)
+    yy, xx = np.indices((work_size[1], work_size[0]))
+    checker_select = ((xx // block + yy // block) % 2).astype(bool)
+    original_array = np.asarray(original_work, dtype=np.uint8)
+    edited_array = np.asarray(normalized, dtype=np.uint8)
+    checker_array = original_array.copy()
+    checker_array[checker_select] = edited_array[checker_select]
+    checker = Image.fromarray(checker_array, mode="RGB")
+    mask_overlay(checker, hard_work, (255, 210, 0), 62).save(
+        output_dir / "registration-checkerboard.png"
+    )
+
+    protected = np.asarray(hard_work, dtype=np.uint8) < 128
+    protected_overlay = original_array.copy()
+    blended = np.rint(
+        original_array.astype(np.float32) * 0.5 + edited_array.astype(np.float32) * 0.5
+    ).astype(np.uint8)
+    protected_overlay[protected] = blended[protected]
+    Image.fromarray(protected_overlay, mode="RGB").save(
+        output_dir / "registration-protected-overlay.png"
+    )
+
+    review = {
+        "status": "accepted" if args.accept_registration else "pending",
+        "edited_input_size": list(edited_input.size),
+        "expected_work_size": list(work_size),
+        "resized_to_work_size": edited_input.size != work_size,
+        "aspect_ratio_error": round(ratio_error, 6),
+        "required_review": [
+            "protected landmarks align in registration-checkerboard.png",
+            "no framing, scale, translation, or perspective drift",
+            "replacement footprint fits completely inside the authored mask",
+            "no outgoing-object residue will remain outside the mask",
+        ],
+    }
+    save_json(output_dir / "registration.json", review)
+
+    if args.accept_registration:
+        manifest.update(
+            {
+                "edited_crop": str(staged_path),
+                "edited_crop_sha256": sha256(staged_path),
+                "edited_input_size": list(edited_input.size),
+                "registration_reviewed": True,
+                "registration_status": "accepted",
+                "registration_resized": edited_input.size != work_size,
+                "registration_aspect_ratio_error": round(ratio_error, 6),
+            }
+        )
+        manifest["paths"].update(
+            {
+                "edited_staged": str(staged_path),
+                "registration_side_by_side": str(output_dir / "registration-side-by-side.png"),
+                "registration_checkerboard": str(output_dir / "registration-checkerboard.png"),
+                "registration_protected_overlay": str(
+                    output_dir / "registration-protected-overlay.png"
+                ),
+            }
+        )
+        save_json(manifest_path, manifest)
+
+    print(json.dumps({"manifest": str(manifest_path), **review, "staged_crop": str(staged_path)}, indent=2))
+
+
 def command_compose(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest).resolve()
     manifest = read_json(manifest_path)
@@ -611,13 +725,34 @@ def command_compose(args: argparse.Namespace) -> None:
     edited_crop_path = Path(args.edited_crop).resolve()
     if not edited_crop_path.is_file():
         fail(f"Edited crop not found: {edited_crop_path}")
+    if args.force_resize:
+        fail(
+            "Blind compose-time resizing is disabled. Run stage, inspect the registration overlays, "
+            "then rerun stage with --accept-registration"
+        )
+    if manifest.get("mode") in {"replace", "integrate"} and not manifest.get(
+        "registration_reviewed", False
+    ):
+        fail(
+            "Replace and integrate crops require an accepted registration gate. Run stage, inspect its "
+            "overlays, then rerun stage with --accept-registration"
+        )
     expected_edited_sha = manifest.get("edited_crop_sha256")
     if expected_edited_sha and sha256(edited_crop_path) != expected_edited_sha:
-        fail("Edited crop differs from the crop used to build the post-generation mask")
+        fail("Edited crop differs from the staged or post-masked crop recorded in the manifest")
     with Image.open(edited_crop_path) as opened:
         edited = opened.convert(source.mode)
     cx, cy, cw, ch = [int(v) for v in manifest["context_bbox"]]
-    edited_native = fit_image(edited, (cw, ch), force=args.force_resize)
+    work_size = tuple(int(value) for value in manifest["work_size"])
+    if edited.size == work_size:
+        edited_native = edited.resize((cw, ch), RESAMPLE)
+    elif edited.size == (cw, ch):
+        edited_native = edited.copy()
+    else:
+        fail(
+            f"Edited crop size {edited.size} is neither prepared work size {work_size} nor native context "
+            f"size {(cw, ch)}. Do not resize it manually; run stage and inspect registration first"
+        )
     edited_native.save(manifest_path.parent / "edited-native.png")
     original_crop = source.crop((cx, cy, cx + cw, cy + ch))
     hard_mask = Image.open(manifest["paths"]["mask_hard_native"]).convert("L")
@@ -743,8 +878,9 @@ def command_verify(args: argparse.Namespace) -> None:
         reject_if.append("post-generation mask retains unrelated regenerated background")
     else:
         reject_if.insert(0, "old defect remains")
+    visual_acceptance = args.visual_acceptance
     visual_review = {
-        "status": "pending",
+        "status": visual_acceptance,
         "mode": manifest.get("mode", "repair"),
         "required_scales": ["200% boundary", "100% object", "fit-to-screen full frame"],
         "must_be_true": manifest.get("invariants", []),
@@ -755,10 +891,19 @@ def command_verify(args: argparse.Namespace) -> None:
     save_json(verify_dir / "visual-review.json", visual_review)
 
     technical_pass = changed_outside_soft == 0
+    delivery_allowed = technical_pass and visual_acceptance == "pass"
     result = {
-        "pass": technical_pass,
+        "pass": delivery_allowed,
         "technical_pass": technical_pass,
-        "visual_acceptance": "pending",
+        "visual_acceptance": visual_acceptance,
+        "delivery_allowed": delivery_allowed,
+        "required_next_action": (
+            "deliver"
+            if delivery_allowed
+            else "inspect visual-review artifacts and rerun verify with --visual-acceptance pass"
+            if technical_pass and visual_acceptance == "pending"
+            else "reject or repair the candidate"
+        ),
         "changed_pixels_outside_soft_mask": changed_outside_soft,
         "max_channel_difference_outside_soft_mask": max_outside_soft,
         "changed_pixels_outside_hard_mask": changed_outside_hard,
@@ -770,6 +915,8 @@ def command_verify(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
     if changed_outside_soft:
         raise SystemExit(2)
+    if visual_acceptance == "fail":
+        raise SystemExit(3)
 
 
 def gradient(image: Image.Image) -> np.ndarray:
@@ -899,6 +1046,16 @@ def build_parser() -> argparse.ArgumentParser:
     postmask.add_argument("--force-resize", action="store_true")
     postmask.set_defaults(func=command_postmask)
 
+    stage = commands.add_parser(
+        "stage",
+        help="Normalize an edited crop and create registration overlays before replacement compositing",
+    )
+    stage.add_argument("manifest")
+    stage.add_argument("edited_crop")
+    stage.add_argument("--force-resize", action="store_true")
+    stage.add_argument("--accept-registration", action="store_true")
+    stage.set_defaults(func=command_stage)
+
     compose = commands.add_parser("compose", help="Composite one edited crop through the local mask")
     compose.add_argument("manifest")
     compose.add_argument("edited_crop")
@@ -912,6 +1069,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("manifest")
     verify.add_argument("output")
     verify.add_argument("verify_dir")
+    verify.add_argument(
+        "--visual-acceptance",
+        choices=["pending", "pass", "fail"],
+        default="pending",
+        help="Manual visual gate after inspecting QA artifacts; pending never allows delivery",
+    )
     verify.set_defaults(func=command_verify)
     return parser
 

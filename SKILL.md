@@ -5,7 +5,7 @@ description: Repair, locally replace, integrate, or add a known object in a PNG,
 
 # Frame Patcher
 
-**Version:** 1.3
+**Version:** 1.4
 
 Repair the requested zone without regenerating the full frame. Pixel protection and visual correctness are separate acceptance gates: passing `verify` never proves that the repaired object looks correct or belongs in the scene.
 
@@ -36,6 +36,7 @@ Before editing, define a short task contract:
 - Treat the user's requested method as a hard constraint. If it is impossible, explain why and ask before substituting another technique.
 - Default to one inspection, one strategy, one contextual crop, one main generation, one composite, and one verification.
 - In additive mode, the prepared region is only a placement guide. `compose` must remain blocked until `postmask` stages a mask made from the actual generation.
+- Never make an editor output fit by silently resizing, cropping, stretching, or padding it. Normalize it only through the registration gate below, inspect protected landmarks, and reject coordinate drift before compositing.
 - Do not introduce perspective overlays, manual warps, per-object transforms, code prototypes, or other alternate pipelines unless the user requested them or the agreed generative strategy failed for a named reason and the alternative is approved.
 - Before any retry, identify the specific failed acceptance fact. Do not rerun merely to seek an unspecified improvement.
 - Use an integration pass only when object identity and geometry already pass but the patch still looks pasted on.
@@ -50,6 +51,7 @@ Before editing, define a short task contract:
    - Use a tight bbox only for a simple interior repair.
    - For replacement or integration, use one larger contextual crop that contains the complete related group, its support surface, contact zones, neighboring materials, and useful reflection or lighting cues.
    - Keep the edit mask exact. A larger crop does not authorize a larger changed region.
+   - For replacement, the mask must cover the complete outgoing object and every residue that must disappear. If transparent packaging, reflections, shadows, or a native frame must change with it, treat those pixels as one related replacement group instead of masking only the visible label or center.
    - Use `--context-bbox` when the useful context is asymmetric or automatic expansion misses the support plane.
 
 ```bash
@@ -93,17 +95,31 @@ python3 <skill-dir>/scripts/patch_tools.py postmask \
 ```
 
 Inspect `postmask-overlay-edited.png` and `postmask-overlay-source.png`. The mask must follow the real generated silhouettes, not the earlier placement guide. If a reliable post-generation mask cannot be produced, stop rather than reverting to a guessed silhouette.
-8. Inspect the edited crop and, for additive mode, its staged mask before compositing. Reject it for shifted protected geometry, wrong count or placement, reference drift, remaining defect fragments, broken text, perspective or topology, missing contact shadows or reflections, material mismatch, halos, double contours, technical bars, incorrect aspect ratio, clipped generated silhouettes, or retained regenerated background.
-9. Composite into the immutable source:
+8. Before replacement or integration compositing, run the registration gate on the editor output:
+
+```bash
+python3 <skill-dir>/scripts/patch_tools.py stage \
+  PATCH_DIR/manifest.json EDITED_CROP
+```
+
+Inspect `registration-checkerboard.png`, `registration-protected-overlay.png`, and `registration-side-by-side.png`. Protected landmarks, framing, scale, translation, and perspective must align. A matching aspect ratio is not evidence of registration. If the editor returned another pixel size, changed the cavity or frame, moved the replacement, or let its footprint extend beyond the authored mask, reject it and regenerate or prepare the complete related replacement group. Never solve geometric drift with a blind resize. After the overlays pass, explicitly stage the reviewed crop:
+
+```bash
+python3 <skill-dir>/scripts/patch_tools.py stage \
+  PATCH_DIR/manifest.json EDITED_CROP --accept-registration
+```
+
+For additive mode, `postmask` remains the staging gate. Inspect the edited crop and its staged mask before compositing. Reject any mode for shifted protected geometry, wrong count or placement, reference drift, remaining outgoing-object fragments, broken text, perspective or topology, missing contact shadows or reflections, material mismatch, halos, double contours, technical bars, clipped generated silhouettes, or retained regenerated background.
+9. Composite the registered or post-masked crop into the immutable source. `compose` must reject replacement and integration crops without accepted registration, and must reject arbitrary crop dimensions instead of resizing them silently:
 
 ```bash
 python3 <skill-dir>/scripts/patch_tools.py compose \
-  PATCH_DIR/manifest.json EDITED_CROP OUTPUT.png
+  PATCH_DIR/manifest.json PATCH_DIR/edited-staged.png OUTPUT.png
 ```
 
 Use `--grain` only when visible source grain makes the patch unnaturally smooth. Avoid it for text, thin lines, and fragile geometry.
 
-10. Run verification:
+10. Run technical verification first:
 
 ```bash
 python3 <skill-dir>/scripts/patch_tools.py verify \
@@ -111,6 +127,15 @@ python3 <skill-dir>/scripts/patch_tools.py verify \
 ```
 
 Require `technical_pass: true`, then inspect `qa-contact-sheet.png` and `boundary-overlay.png` at 200%, the repaired object at 100%, and the full frame fit-to-screen. Accept only if every `must_be_true` fact passes, no protected area is damaged, and the patch does not attract attention as a pasted element.
+
+The first verification intentionally returns `visual_acceptance: pending`, `pass: false`, and `delivery_allowed: false`, even when pixel protection passes. After the required visual inspection, record the result explicitly:
+
+```bash
+python3 <skill-dir>/scripts/patch_tools.py verify \
+  PATCH_DIR/manifest.json OUTPUT.png VERIFY_DIR --visual-acceptance pass
+```
+
+Never deliver while `delivery_allowed` is false. A technical pass proves only that pixels outside the soft mask were protected; it does not prove that the replacement is complete, aligned, legible, or visually integrated.
 
 11. If identity and geometry pass but scene integration fails, prepare one `--mode integrate` fallback from the latest accepted composite. Mask only the object surfaces and physically necessary nearby shadow or reflection zones. Preserve count, design, text, geometry, placement, and perspective.
 12. Build later patches only from the latest visually accepted composite. Retain the original source and manifests locally until acceptance.

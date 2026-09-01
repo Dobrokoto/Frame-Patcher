@@ -1,6 +1,6 @@
 # Frame Patcher
 
-**Version 1.3**
+**Version 1.4**
 
 Скилл для ChatGPT и Codex, который точечно чинит, заменяет или добавляет объекты в изображение без перегенерации всего кадра.
 
@@ -10,15 +10,15 @@
 
 Полезен для рук, лиц, надписей, мелких объектов, швов и AI-артефактов, а также для аккуратного добавления новых объектов — особенно когда полнокадровая правка начинает шакалить хороший исходник.
 
-В версии 1.3 добавлены:
+В версии 1.4 добавлены:
 
-- режим `additive` для добавления новых объектов;
-- пайплайн «большой контекстный кроп → генерация → маска по фактическому силуэту → композит»;
-- placement guide вместо преждевременной точной маски;
-- команда `postmask` для подготовки маски после генерации;
-- сохранение мягкой grayscale-маски, контактных теней и отражений;
-- блокировка композита до создания post-generation mask;
-- отдельная визуальная приёмка для добавленных объектов.
+- обязательная команда `stage` перед композитом в режимах repair, replace и integrate;
+- checkerboard, protected-overlay и side-by-side для проверки регистрации кропа;
+- запрет на скрытое растяжение, кроп и подгонку редакторского результата;
+- требование маскировать весь заменяемый объект вместе с остатками, зависимым прозрачным блистером и отражениями;
+- блокировка `compose`, если редакторский кроп не зарегистрирован и явно не принят;
+- двухступенчатая команда `verify`: техническая проверка и отдельный ручной визуальный допуск;
+- запрет выдачи результата, пока `visual_acceptance` не установлен в `pass`.
 
 ## Что внутри
 
@@ -35,7 +35,9 @@
 
 Frame Patcher is a ChatGPT and Codex skill for repairing, replacing, or adding a localized element without regenerating or degrading the entire image.
 
-For repairs and replacements, it prepares a contextual crop and an exact edit mask before generation. For new objects, version 1.3 introduces an additive workflow: generate the object inside a sufficiently large contextual crop, align the result to the source, derive the mask from the actual generated silhouette, retain required contact shadows or reflections, and composite only those pixels back into the immutable master.
+For repairs and replacements, it prepares a contextual crop and an exact edit mask before generation. For new objects, the additive workflow generates inside a sufficiently large contextual crop and derives the mask from the actual generated silhouette.
+
+Version 1.4 adds a mandatory registration stage before compositing repair, replacement, or integration edits. Editor outputs may not be silently stretched, cropped, or resized into place. Registration is reviewed with checkerboard, protected-overlay, and side-by-side artifacts, and delivery remains blocked until both technical verification and explicit visual acceptance pass.
 
 Technical verification protects pixels outside the authorized region. A separate visual gate checks geometry, silhouette integrity, scale, contact, seams, and semantic correctness. A technically safe composite is never presented as successful until the edited or added object also passes visual review.
 
