@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic local crop, mask, composite, locate, and verification tools."""
+"""Deterministic local crop, post-mask, composite, locate, and verification tools."""
 
 from __future__ import annotations
 
@@ -56,6 +56,14 @@ def clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tupl
     x1 = max(x0 + 1, min(width, x + w))
     y1 = max(y0 + 1, min(height, y + h))
     return x0, y0, x1 - x0, y1 - y0
+
+
+def bbox_contains(
+    outer: tuple[int, int, int, int], inner: tuple[int, int, int, int]
+) -> bool:
+    ox, oy, ow, oh = outer
+    ix, iy, iw, ih = inner
+    return ox <= ix and oy <= iy and ox + ow >= ix + iw and oy + oh >= iy + ih
 
 
 def expand_bbox(
@@ -154,6 +162,15 @@ def fit_image(image: Image.Image, size: tuple[int, int], force: bool = False) ->
     return image.resize(size, RESAMPLE)
 
 
+def load_mask(path: Path) -> Image.Image:
+    with Image.open(path) as opened:
+        if opened.mode == "RGBA":
+            alpha = opened.getchannel("A")
+            if alpha.getextrema() != (255, 255):
+                return alpha.copy()
+        return opened.convert("L")
+
+
 def command_prepare(args: argparse.Namespace) -> None:
     source_path = Path(args.source).resolve()
     output_dir = Path(args.output_dir).resolve()
@@ -196,7 +213,17 @@ def command_prepare(args: argparse.Namespace) -> None:
         fail("prepare requires --bbox, --mask, or --polygon")
 
     target_bbox = clamp_bbox(target_bbox, width, height)
-    context_bbox = expand_bbox(target_bbox, width, height, args.context, args.min_padding)
+    if args.context_bbox:
+        requested_context = parse_bbox(args.context_bbox)
+        context_bbox = clamp_bbox(requested_context, width, height)
+        if context_bbox != requested_context:
+            fail(f"Context bbox {requested_context} extends outside source size {source.size}")
+        if not bbox_contains(context_bbox, target_bbox):
+            fail(f"Context bbox {context_bbox} must fully contain target bbox {target_bbox}")
+        context_source = "explicit-bbox"
+    else:
+        context_bbox = expand_bbox(target_bbox, width, height, args.context, args.min_padding)
+        context_source = "expanded-target"
     cx, cy, cw, ch = context_bbox
     tx, ty, tw, th = target_bbox
     local_bbox = (tx - cx, ty - cy, tw, th)
@@ -227,6 +254,9 @@ def command_prepare(args: argparse.Namespace) -> None:
     soft_native.save(soft_native_path)
     hard_work.save(hard_work_path)
     soft_work.save(soft_work_path)
+    if args.mode == "additive":
+        hard_native.save(output_dir / "placement-guide-native.png")
+        hard_work.save(output_dir / "placement-guide-work.png")
 
     full_hard = Image.new("L", source.size, 0)
     full_hard.paste(hard_native, (cx, cy))
@@ -245,12 +275,27 @@ def command_prepare(args: argparse.Namespace) -> None:
     invariants = [item.strip() for item in (args.invariant or []) if item.strip()]
     protected = [item.strip() for item in (args.protected or []) if item.strip()]
     uncertain = [item.strip() for item in (args.uncertain or []) if item.strip()]
-    if args.risk == "reconstruction" and mask_source == "bbox":
+    if args.risk == "reconstruction" and mask_source == "bbox" and args.mode != "additive":
         warnings.append(
             "Reconstruction uses a generated bbox mask; prefer --mask or --polygon for silhouettes and multi-material edges"
         )
     if args.risk == "reconstruction" and not uncertain:
         warnings.append("Reconstruction has no declared uncertain region; do not imply exact recovery")
+    occupancy = (tw / cw, th / ch)
+    if args.mode in {"replace", "integrate", "additive"} and max(occupancy) > 0.75:
+        warnings.append(
+            "Target or placement guide occupies more than 75% of the context crop on one axis; "
+            "use a larger or asymmetric --context-bbox when scene lighting or contact surfaces are missing"
+        )
+    if args.mode in {"replace", "additive"} and not invariants:
+        warnings.append(
+            f"{args.mode.capitalize()} mode has no visible invariants; record count, geometry, design, or reference facts"
+        )
+    if args.mode == "additive":
+        warnings.append(
+            "The prepared region is a placement guide, not a composite mask. Generate the full clean crop first, "
+            "then run postmask with a mask made from the actual generated result."
+        )
     contract_lines = []
     if invariants:
         contract_lines.append("Must be true: " + "; ".join(invariants) + ".")
@@ -258,21 +303,50 @@ def command_prepare(args: argparse.Namespace) -> None:
         contract_lines.append("Protect: " + "; ".join(protected) + ".")
     if uncertain:
         contract_lines.append("Uncertain hidden structure: " + "; ".join(uncertain) + ".")
-    prompt = (
-        "Use case: precise-object-edit\n"
-        "Inputs: first image is a context crop; second image, when provided, is the exact edit mask "
+    mode_instruction = {
+        "repair": (
+            "Repair only the indicated defect. Preserve the surrounding object structure and do not redesign it."
+        ),
+        "replace": (
+            "Replace only the masked object or related object group. Treat supplied visual references as "
+            "authoritative for identity, brand, text, color, shape, and material. Preserve required count, "
+            "placement, scale, overlap, perspective, and contact relationships. Match the crop's existing "
+            "lighting, reflections, shadows, texture, grain, and sharpness so the replacement belongs in the scene."
+        ),
+        "integrate": (
+            "Keep the accepted object identity, count, design, text, geometry, placement, and perspective unchanged. "
+            "Adjust only physical integration within the mask: local highlights, reflections, contact shadows, "
+            "material microtexture, grain, sharpness, and color response."
+        ),
+        "additive": (
+            "Add the requested new object or related object group directly into the whole clean context crop. "
+            "The placement guide is approximate and must not clip or determine the final silhouette. Generate complete "
+            "anatomy or geometry together with physically necessary contact shadows, reflections, and local interaction. "
+            "Do not use a pre-generation silhouette mask. A post-generation mask will be created from this result."
+        ),
+    }[args.mode]
+    input_instruction = (
+        "Inputs: first image is the clean context crop. A second image, when provided, is only an approximate "
+        "placement guide; it is not an edit mask and does not define the final silhouette.\n"
+        if args.mode == "additive"
+        else "Inputs: first image is a context crop; second image, when provided, is the exact edit mask "
         "where white may change and black must remain unchanged.\n"
-        f"Primary request: {request}.\n"
+    )
+    prompt = (
+        f"Use case: precise-object-{args.mode}\n"
+        + input_instruction
+        + f"Primary request: {request}.\n"
+        f"Edit mode: {args.mode}.\n"
         f"Risk class: {args.risk}.\n"
         + ("\n".join(contract_lines) + "\n" if contract_lines else "")
-        + "Change only the indicated central defect. Preserve crop framing, camera, identity, geometry, "
-        "lighting, color, perspective, texture and all surrounding context. Return the same composition "
+        + mode_instruction
+        + " Preserve crop framing, camera, and all surrounding context. Return the same composition "
         "and aspect ratio. Do not beautify, reframe, add objects, or modify unrelated pixels."
     )
     (output_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 4,
         "source": str(source_copy),
         "source_sha256": sha256(source_copy),
         "source_size": [width, height],
@@ -281,11 +355,16 @@ def command_prepare(args: argparse.Namespace) -> None:
         "mask_source": mask_source,
         "target_bbox": list(target_bbox),
         "context_bbox": list(context_bbox),
+        "context_source": context_source,
+        "target_occupancy": [round(value, 4) for value in occupancy],
         "local_bbox": list(local_bbox),
         "work_size": list(work_size),
         "work_scale": scale,
         "feather": feather,
         "edge": args.edge,
+        "mode": args.mode,
+        "mask_role": "placement-guide" if args.mode == "additive" else "edit-mask",
+        "additive_mask_ready": args.mode != "additive",
         "risk": args.risk,
         "request": request,
         "invariants": invariants,
@@ -305,14 +384,24 @@ def command_prepare(args: argparse.Namespace) -> None:
             "prompt": str(output_dir / "prompt.txt"),
         },
     }
+    if args.mode == "additive":
+        manifest["paths"].update(
+            {
+                "placement_guide_native": str(output_dir / "placement-guide-native.png"),
+                "placement_guide_work": str(output_dir / "placement-guide-work.png"),
+            }
+        )
     save_json(output_dir / "manifest.json", manifest)
     print(
         json.dumps(
             {
                 "target_bbox": target_bbox,
                 "context_bbox": context_bbox,
+                "context_source": context_source,
+                "target_occupancy": [round(value, 4) for value in occupancy],
                 "work_size": work_size,
                 "coordinate_space": "source_native",
+                "mode": args.mode,
                 "risk": args.risk,
                 "feather": feather,
                 "warnings": warnings,
@@ -349,16 +438,183 @@ def color_match_patch(patch: np.ndarray, original: np.ndarray, ring: np.ndarray,
     return np.clip(result, 0, 255)
 
 
-def command_compose(args: argparse.Namespace) -> None:
+def command_postmask(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest).resolve()
     manifest = read_json(manifest_path)
+    if manifest.get("mode") != "additive":
+        fail("postmask is only valid for a manifest prepared with --mode additive")
+
     source_path = Path(manifest["source"])
     if sha256(source_path) != manifest["source_sha256"]:
         fail("Immutable source copy hash changed")
     with Image.open(source_path) as opened:
         source = opened.copy()
     require_rgb(source, "Source")
-    with Image.open(args.edited_crop) as opened:
+
+    edited_crop_path = Path(args.edited_crop).resolve()
+    post_mask_path = Path(args.post_mask).resolve()
+    if not edited_crop_path.is_file():
+        fail(f"Edited crop not found: {edited_crop_path}")
+    if not post_mask_path.is_file():
+        fail(f"Post-generation mask not found: {post_mask_path}")
+
+    with Image.open(edited_crop_path) as opened:
+        edited = opened.convert(source.mode)
+        edited_input_size = edited.size
+    cx, cy, cw, ch = [int(value) for value in manifest["context_bbox"]]
+    edited_native = fit_image(edited, (cw, ch), force=args.force_resize)
+
+    mask = load_mask(post_mask_path)
+    work_size = tuple(int(value) for value in manifest["work_size"])
+    if mask.size == source.size:
+        mask_native = mask.crop((cx, cy, cx + cw, cy + ch))
+        mask_coordinate_space = "source-native"
+    elif mask.size == (cw, ch):
+        mask_native = mask.copy()
+        mask_coordinate_space = "context-native"
+    elif mask.size == edited_input_size:
+        mask_native = fit_image(mask, (cw, ch), force=args.force_resize)
+        mask_coordinate_space = "edited-crop"
+    elif mask.size == work_size:
+        mask_native = mask.resize((cw, ch), RESAMPLE)
+        mask_coordinate_space = "work-crop"
+    else:
+        mask_native = fit_image(mask, (cw, ch), force=args.force_resize)
+        mask_coordinate_space = "resized-mask"
+
+    mask_array = np.asarray(mask_native, dtype=np.uint8)
+    if not np.any(mask_array >= 8):
+        fail("Post-generation mask contains no selected pixels")
+    hard_native = mask_native.point(lambda value: 255 if value >= 128 else 0)
+    hard_box = hard_native.getbbox()
+    if not hard_box:
+        fail("Post-generation mask has no pixels at or above 50% opacity")
+
+    has_soft_values = bool(np.any((mask_array > 0) & (mask_array < 255)))
+    if args.feather is None and has_soft_values:
+        soft_native = mask_native.copy()
+        feather = "preserved-from-mask"
+    else:
+        try:
+            stored_feather = float(manifest.get("feather", 3.0))
+        except (TypeError, ValueError):
+            stored_feather = 3.0
+        feather_radius = (
+            float(args.feather)
+            if args.feather is not None
+            else stored_feather
+        )
+        soft_native = (
+            hard_native.filter(ImageFilter.GaussianBlur(radius=max(0.0, feather_radius)))
+            if feather_radius > 0
+            else hard_native.copy()
+        )
+        feather = feather_radius
+
+    hard_work = hard_native.resize(work_size, Image.Resampling.NEAREST)
+    soft_work = soft_native.resize(work_size, RESAMPLE)
+    output_dir = manifest_path.parent
+    edited_native_path = output_dir / "edited-native.png"
+    hard_native_path = output_dir / "mask-hard-native.png"
+    soft_native_path = output_dir / "mask-soft-native.png"
+    hard_work_path = output_dir / "mask-hard-work.png"
+    soft_work_path = output_dir / "mask-soft-work.png"
+    edited_native.save(edited_native_path)
+    hard_native.save(hard_native_path)
+    soft_native.save(soft_native_path)
+    hard_work.save(hard_work_path)
+    soft_work.save(soft_work_path)
+
+    mask_overlay(edited_native, soft_native, (255, 210, 0), 105).save(
+        output_dir / "postmask-overlay-edited.png"
+    )
+    source_crop = source.crop((cx, cy, cx + cw, cy + ch))
+    mask_overlay(source_crop, soft_native, (255, 30, 30), 92).save(
+        output_dir / "postmask-overlay-source.png"
+    )
+
+    local_bbox = (
+        hard_box[0],
+        hard_box[1],
+        hard_box[2] - hard_box[0],
+        hard_box[3] - hard_box[1],
+    )
+    target_bbox = (cx + local_bbox[0], cy + local_bbox[1], local_bbox[2], local_bbox[3])
+    selected_fraction = float(np.count_nonzero(mask_array >= 8)) / float(cw * ch)
+    warnings = [
+        item
+        for item in manifest.get("warnings", [])
+        if not str(item).startswith("The prepared region is a placement guide")
+    ]
+    if selected_fraction > 0.6:
+        warnings.append(
+            "Post-generation mask covers more than 60% of the context crop; inspect whether unrelated regenerated "
+            "background was retained"
+        )
+
+    manifest.update(
+        {
+            "target_bbox": list(target_bbox),
+            "local_bbox": list(local_bbox),
+            "mask_source": "post-generation-mask",
+            "mask_role": "post-generation-mask",
+            "additive_mask_ready": True,
+            "postmask_coordinate_space": mask_coordinate_space,
+            "postmask_selected_fraction": round(selected_fraction, 4),
+            "edited_crop": str(edited_crop_path),
+            "edited_crop_sha256": sha256(edited_crop_path),
+            "postmask_input": str(post_mask_path),
+            "postmask_input_sha256": sha256(post_mask_path),
+            "feather": feather,
+            "warnings": warnings,
+        }
+    )
+    manifest["paths"].update(
+        {
+            "edited_native": str(edited_native_path),
+            "mask_hard_native": str(hard_native_path),
+            "mask_soft_native": str(soft_native_path),
+            "mask_hard_work": str(hard_work_path),
+            "mask_soft_work": str(soft_work_path),
+            "postmask_overlay_edited": str(output_dir / "postmask-overlay-edited.png"),
+            "postmask_overlay_source": str(output_dir / "postmask-overlay-source.png"),
+        }
+    )
+    save_json(manifest_path, manifest)
+    print(
+        json.dumps(
+            {
+                "manifest": str(manifest_path),
+                "target_bbox": target_bbox,
+                "postmask_coordinate_space": mask_coordinate_space,
+                "selected_fraction": round(selected_fraction, 4),
+                "feather": feather,
+                "additive_mask_ready": True,
+                "warnings": warnings,
+            },
+            indent=2,
+        )
+    )
+
+
+def command_compose(args: argparse.Namespace) -> None:
+    manifest_path = Path(args.manifest).resolve()
+    manifest = read_json(manifest_path)
+    if manifest.get("mode") == "additive" and not manifest.get("additive_mask_ready", False):
+        fail("Additive compose requires a post-generation mask. Run the postmask command first")
+    source_path = Path(manifest["source"])
+    if sha256(source_path) != manifest["source_sha256"]:
+        fail("Immutable source copy hash changed")
+    with Image.open(source_path) as opened:
+        source = opened.copy()
+    require_rgb(source, "Source")
+    edited_crop_path = Path(args.edited_crop).resolve()
+    if not edited_crop_path.is_file():
+        fail(f"Edited crop not found: {edited_crop_path}")
+    expected_edited_sha = manifest.get("edited_crop_sha256")
+    if expected_edited_sha and sha256(edited_crop_path) != expected_edited_sha:
+        fail("Edited crop differs from the crop used to build the post-generation mask")
+    with Image.open(edited_crop_path) as opened:
         edited = opened.convert(source.mode)
     cx, cy, cw, ch = [int(v) for v in manifest["context_bbox"]]
     edited_native = fit_image(edited, (cw, ch), force=args.force_resize)
@@ -474,19 +730,27 @@ def command_verify(args: argparse.Namespace) -> None:
     contact.paste(panels[3], (panels[0].width, panels[0].height))
     contact.save(verify_dir / "qa-contact-sheet.png")
 
+    reject_if = [
+        "protected geometry shifted",
+        "new object or anatomy error",
+        "broken topology, text, perspective, or material",
+        "lighting, reflections, contact shadows, grain, or sharpness do not match the scene",
+        "the patch attracts attention or looks pasted on at fit-to-screen scale",
+        "halo, seam, or double contour",
+    ]
+    if manifest.get("mode") == "additive":
+        reject_if.insert(0, "requested addition is missing, incomplete, clipped, or floating")
+        reject_if.append("post-generation mask retains unrelated regenerated background")
+    else:
+        reject_if.insert(0, "old defect remains")
     visual_review = {
         "status": "pending",
+        "mode": manifest.get("mode", "repair"),
         "required_scales": ["200% boundary", "100% object", "fit-to-screen full frame"],
         "must_be_true": manifest.get("invariants", []),
         "protected": manifest.get("protected", []),
         "uncertain": manifest.get("uncertain", []),
-        "reject_if": [
-            "old defect remains",
-            "protected geometry shifted",
-            "new object or anatomy error",
-            "broken topology, text, perspective, or material",
-            "halo, seam, or double contour",
-        ],
+        "reject_if": reject_if,
     }
     save_json(verify_dir / "visual-review.json", visual_review)
 
@@ -595,7 +859,17 @@ def build_parser() -> argparse.ArgumentParser:
     region.add_argument("--mask", help="Source-sized grayscale mask")
     region.add_argument("--polygon", help="JSON file with source-native polygon points")
     prepare.add_argument("--request", default="repair the indicated defect")
+    prepare.add_argument(
+        "--mode",
+        choices=["repair", "replace", "integrate", "additive"],
+        default="repair",
+        help="Edit strategy: repair, referenced replacement, physical integration, or post-masked addition",
+    )
     prepare.add_argument("--context", type=float, default=2.5)
+    prepare.add_argument(
+        "--context-bbox",
+        help="Optional explicit source-native x,y,width,height crop; must fully contain the edit target",
+    )
     prepare.add_argument("--min-padding", type=int, default=48)
     prepare.add_argument("--work-size", type=int, default=1024)
     prepare.add_argument("--feather", type=float, default=None, help="Explicit feather radius; default is adaptive")
@@ -608,6 +882,22 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--protected", action="append", help="Nearby structure that must remain unchanged")
     prepare.add_argument("--uncertain", action="append", help="Hidden structure not recoverable from source pixels")
     prepare.set_defaults(func=command_prepare)
+
+    postmask = commands.add_parser(
+        "postmask",
+        help="Stage an additive generation with a mask created from the actual generated result",
+    )
+    postmask.add_argument("manifest")
+    postmask.add_argument("edited_crop")
+    postmask.add_argument("post_mask")
+    postmask.add_argument(
+        "--feather",
+        type=float,
+        default=None,
+        help="Override feather radius; grayscale masks preserve their authored softness by default",
+    )
+    postmask.add_argument("--force-resize", action="store_true")
+    postmask.set_defaults(func=command_postmask)
 
     compose = commands.add_parser("compose", help="Composite one edited crop through the local mask")
     compose.add_argument("manifest")

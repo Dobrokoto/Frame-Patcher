@@ -1,26 +1,30 @@
 # Frame Patcher
 
-**Version 1.1**
+**Version 1.3**
 
-Скилл для ChatGPT и Codex, который точечно чинит отдельные участки изображения без перегенерации всего кадра.
+Скилл для ChatGPT и Codex, который точечно чинит, заменяет или добавляет объекты в изображение без перегенерации всего кадра.
 
-Он вырезает проблемную область с контекстом, передаёт редактору кроп и точную маску, а затем возвращает исправление в неизменяемый исходник. Техническая проверка защищает пиксели вне разрешённой зоны, а отдельная визуальная приёмка проверяет геометрию, силуэты, швы и смысловую правильность ремонта.
+Для ремонта существующего дефекта он вырезает проблемную область с контекстом, передаёт редактору кроп и точную маску, а затем возвращает исправление в неизменяемый исходник. Для добавления нового объекта работает иначе: сначала генерирует его в достаточно большом контекстном кропе, после генерации строит маску по реальному силуэту и сохраняет только объект, контактную тень и необходимые отражения.
 
-Полезен для рук, лиц, надписей, мелких объектов, швов и AI-артефактов — особенно когда полнокадровая правка начинает шакалить хороший исходник.
+Техническая проверка защищает пиксели вне разрешённой зоны, а отдельная визуальная приёмка проверяет геометрию, силуэты, швы, масштаб, опору и смысловую правильность результата.
 
-В версии 1.1 добавлены:
+Полезен для рук, лиц, надписей, мелких объектов, швов и AI-артефактов, а также для аккуратного добавления новых объектов — особенно когда полнокадровая правка начинает шакалить хороший исходник.
 
-- классификация обычного ремонта, логически выводимой правки и реконструкции скрытых областей;
-- source-native polygon masks и предупреждения для рискованных bbox-масок;
-- адаптивная растушёвка для жёстких и мягких границ;
-- инварианты, защищённые и неопределённые зоны;
-- QA contact sheet, проверка контура и раздельные технический/визуальный статусы;
-- обязательная смена стратегии после повторяющихся неудач.
+В версии 1.3 добавлены:
+
+- режим `additive` для добавления новых объектов;
+- пайплайн «большой контекстный кроп → генерация → маска по фактическому силуэту → композит»;
+- placement guide вместо преждевременной точной маски;
+- команда `postmask` для подготовки маски после генерации;
+- сохранение мягкой grayscale-маски, контактных теней и отражений;
+- блокировка композита до создания post-generation mask;
+- отдельная визуальная приёмка для добавленных объектов.
 
 ## Что внутри
 
-- `SKILL.md` — логика и рабочий пайплайн.
-- `scripts/patch_tools.py` — подготовка кропов и масок, композитинг и проверка.
+- `SKILL.md` — логика, маршрутизация режимов и рабочий пайплайн.
+- `scripts/patch_tools.py` — подготовка кропов, масок, композитинг и проверка.
+- `references/additive.md` — добавление новых объектов через post-generation masking.
 - `references/visual-acceptance.md` — приёмка сложных реконструкций и связанных объектов.
 - `agents/openai.yaml` — интерфейс скилла.
 - `assets/icon.svg` — иконка.
@@ -29,16 +33,17 @@
 
 ## English
 
-Frame Patcher is a ChatGPT and Codex skill for repairing a known local defect without regenerating or degrading the entire image. It prepares a contextual crop and an exact edit mask, sends only that crop to the image editor, composites the accepted result back into the immutable source, and verifies pixel protection outside the authorized area.
+Frame Patcher is a ChatGPT and Codex skill for repairing, replacing, or adding a localized element without regenerating or degrading the entire image.
 
-Version 1.1 distinguishes straightforward repairs from inferred edits and uncertain reconstruction of hidden geometry. It adds source-native polygon masks, adaptive feathering, task invariants, protected and uncertain regions, boundary inspection, a QA contact sheet, and separate technical and visual acceptance gates. A technically safe composite is never presented as a successful repair until the edited object also passes visual review.
+For repairs and replacements, it prepares a contextual crop and an exact edit mask before generation. For new objects, version 1.3 introduces an additive workflow: generate the object inside a sufficiently large contextual crop, align the result to the source, derive the mask from the actual generated silhouette, retain required contact shadows or reflections, and composite only those pixels back into the immutable master.
 
-The skill is useful for malformed hands and faces, text, signs, small objects, silhouettes, seams, occluder removal, and AI artifacts—especially when repeated full-frame edits would damage an otherwise strong image.
+Technical verification protects pixels outside the authorized region. A separate visual gate checks geometry, silhouette integrity, scale, contact, seams, and semantic correctness. A technically safe composite is never presented as successful until the edited or added object also passes visual review.
 
 ### Repository contents
 
-- `SKILL.md` — routing, workflow, constraints, and stopping rules.
-- `scripts/patch_tools.py` — crop preparation, exact masks, compositing, and verification.
+- `SKILL.md` — routing, workflows, constraints, and stopping rules.
+- `scripts/patch_tools.py` — crop preparation, pre-generation and post-generation masks, compositing, and verification.
+- `references/additive.md` — additive workflow and post-generation masking.
 - `references/visual-acceptance.md` — acceptance guidance for reconstruction and dependent objects.
 - `agents/openai.yaml` — skill interface metadata.
 - `assets/icon.svg` — skill icon.
